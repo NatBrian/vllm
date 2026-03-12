@@ -13,6 +13,25 @@ import typing
 # other modules are imported.
 import vllm.env_override  # noqa: F401
 
+# Compatibility shim for torch builds that do not expose
+# torch.accelerator.empty_cache().
+try:
+    import torch
+
+    if not hasattr(torch, "accelerator"):
+
+        class _TorchAcceleratorCompat:
+            @staticmethod
+            def empty_cache() -> None:
+                if hasattr(torch, "cuda"):
+                    torch.cuda.empty_cache()
+
+        torch.accelerator = _TorchAcceleratorCompat()  # type: ignore[attr-defined]
+    elif not hasattr(torch.accelerator, "empty_cache"):
+        torch.accelerator.empty_cache = torch.cuda.empty_cache  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 MODULE_ATTRS = {
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
     "EngineArgs": ".engine.arg_utils:EngineArgs",

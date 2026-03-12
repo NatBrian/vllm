@@ -330,13 +330,36 @@ def rotary_embedding(
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
-    torch.ops._C.rms_norm(out, input, weight, epsilon)
+    if hasattr(torch.ops._C, "rms_norm"):
+        torch.ops._C.rms_norm(out, input, weight, epsilon)
+        return
+
+    # Fallback for environments without compiled vLLM custom ops.
+    orig_dtype = input.dtype
+    x = input.to(torch.float32)
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + epsilon)
+    x = x.to(orig_dtype)
+    out.copy_(x * weight)
 
 
 def fused_add_rms_norm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
-    torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+    if hasattr(torch.ops._C, "fused_add_rms_norm"):
+        torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+        return
+
+    # Fallback for environments without compiled vLLM custom ops.
+    x = input + residual
+    residual.copy_(x)
+
+    orig_dtype = x.dtype
+    x_fp32 = x.to(torch.float32)
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    x_fp32 = x_fp32 * torch.rsqrt(variance + epsilon)
+    x = x_fp32.to(orig_dtype)
+    input.copy_(x * weight)
 
 
 def fused_qk_norm_rope(
@@ -695,7 +718,10 @@ if hasattr(torch.ops._C, "ggml_moe_a8_vec"):
 
 # cutlass
 def cutlass_scaled_mm_supports_fp4(cuda_device_capability: int) -> bool:
-    return torch.ops._C.cutlass_scaled_mm_supports_fp4(cuda_device_capability)
+    try:
+        return torch.ops._C.cutlass_scaled_mm_supports_fp4(cuda_device_capability)
+    except AttributeError:
+        return False
 
 
 def cutlass_scaled_fp4_mm(
@@ -714,11 +740,17 @@ def cutlass_scaled_fp4_mm(
 
 
 def cutlass_scaled_mm_supports_fp8(cuda_device_capability: int) -> bool:
-    return torch.ops._C.cutlass_scaled_mm_supports_fp8(cuda_device_capability)
+    try:
+        return torch.ops._C.cutlass_scaled_mm_supports_fp8(cuda_device_capability)
+    except AttributeError:
+        return False
 
 
 def cutlass_scaled_mm_supports_block_fp8(cuda_device_capability: int) -> bool:
-    return torch.ops._C.cutlass_scaled_mm_supports_block_fp8(cuda_device_capability)
+    try:
+        return torch.ops._C.cutlass_scaled_mm_supports_block_fp8(cuda_device_capability)
+    except AttributeError:
+        return False
 
 
 def cutlass_scaled_mm(
@@ -802,7 +834,10 @@ def cutlass_scaled_mm_azp(
 
 
 def cutlass_sparse_scaled_mm_supported(cuda_device_capability: int) -> bool:
-    return torch.ops._C.cutlass_sparse_scaled_mm_supported(cuda_device_capability)
+    try:
+        return torch.ops._C.cutlass_sparse_scaled_mm_supported(cuda_device_capability)
+    except AttributeError:
+        return False
 
 
 def cutlass_group_gemm_supported(cuda_device_capability: int) -> bool:
@@ -2504,16 +2539,30 @@ def reshape_and_cache(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
-    )
+    if hasattr(torch.ops._C_cache_ops, "reshape_and_cache"):
+        torch.ops._C_cache_ops.reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+
+    # Fallback for environments without compiled cache ops.
+    block_size = key_cache.shape[1]
+    valid_mask = slot_mapping >= 0
+    if not torch.any(valid_mask):
+        return
+    token_ids = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+    slots = slot_mapping[token_ids].to(torch.long)
+    block_ids = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = torch.remainder(slots, block_size)
+    key_cache[block_ids, block_offsets] = key[token_ids]
+    value_cache[block_ids, block_offsets] = value[token_ids]
 
 
 def reshape_and_cache_flash(
@@ -2526,16 +2575,30 @@ def reshape_and_cache_flash(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
-    )
+    if hasattr(torch.ops._C_cache_ops, "reshape_and_cache_flash"):
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+
+    # Fallback for environments without compiled cache ops.
+    block_size = key_cache.shape[1]
+    valid_mask = slot_mapping >= 0
+    if not torch.any(valid_mask):
+        return
+    token_ids = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+    slots = slot_mapping[token_ids].to(torch.long)
+    block_ids = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = torch.remainder(slots, block_size)
+    key_cache[block_ids, block_offsets] = key[token_ids]
+    value_cache[block_ids, block_offsets] = value[token_ids]
 
 
 def concat_and_cache_mla(

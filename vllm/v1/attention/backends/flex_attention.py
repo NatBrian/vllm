@@ -41,11 +41,32 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-torch._dynamo.config.recompile_limit = 16
-create_block_mask_compiled = torch.compile(
-    create_block_mask, fullgraph=True, mode="reduce-overhead"
-)
-flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+if hasattr(torch._dynamo.config, "recompile_limit"):
+    torch._dynamo.config.recompile_limit = 16
+elif hasattr(torch._dynamo.config, "cache_size_limit"):
+    torch._dynamo.config.cache_size_limit = 16
+if hasattr(torch._dynamo.config, "capture_scalar_outputs"):
+    torch._dynamo.config.capture_scalar_outputs = True
+if hasattr(torch._dynamo.config, "suppress_errors"):
+    torch._dynamo.config.suppress_errors = True
+
+
+def _can_use_flex_torch_compile() -> bool:
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return False
+    return hasattr(torch, "compile")
+
+
+if _can_use_flex_torch_compile():
+    create_block_mask_compiled = torch.compile(
+        create_block_mask, fullgraph=True, mode="reduce-overhead"
+    )
+    flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+else:
+    create_block_mask_compiled = create_block_mask
+    flex_attention_compiled = flex_attention
 
 
 def _offsets_to_doc_ids_tensor(offsets: torch.Tensor) -> torch.Tensor:
@@ -841,7 +862,9 @@ class FlexAttentionImpl(AttentionImpl):
             return
 
         key_cache, value_cache = kv_cache.unbind(0)
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
+        from vllm import _custom_ops as ops
+
+        ops.reshape_and_cache_flash(
             key,
             value,
             key_cache,
@@ -1011,15 +1034,22 @@ def get_kernel_options(
             device_props = torch.cuda.get_device_properties()
             # ROCm doesn't expose shared_memory_per_block_optin attribute
             # AMD GPUs typically have 64KB LDS (Local Data Share) per workgroup
-            if hasattr(device_props, "shared_memory_per_block_optin"):
+            if (
+                hasattr(device_props, "shared_memory_per_block_optin")
+                and device_props.shared_memory_per_block_optin > 0
+            ):
                 max_shared_memory = device_props.shared_memory_per_block_optin
+            elif hasattr(device_props, "shared_memory_per_block"):
+                max_shared_memory = device_props.shared_memory_per_block
             elif current_platform.is_rocm():
                 # ROCm fallback: use 64KB
                 max_shared_memory = 65536
             else:
-                raise RuntimeError(
-                    "Unable to determine shared memory size on this hardware."
+                logger.warning_once(
+                    "Unable to determine shared memory size for FlexAttention; "
+                    "falling back to 64KB."
                 )
+                max_shared_memory = 65536
 
             if max_shared_memory < 144 * 1024:
                 block_m_candidate = ensure_divisible(

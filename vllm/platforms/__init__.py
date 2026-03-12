@@ -28,7 +28,7 @@ def vllm_version_matches_substr(substr: str) -> bool:
             "The vLLM package was not found, so its version could not be "
             "inspected. This may cause platform detection to fail."
         )
-        raise e
+        return False
     return substr in vllm_version
 
 

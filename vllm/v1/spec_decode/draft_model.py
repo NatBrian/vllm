@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from typing_extensions import override
@@ -54,10 +56,15 @@ class DraftModelProposer(SpecDecodeBaseProposer):
     def _get_model(self) -> nn.Module:
         # Draft models may be quantized or on different parallelism,
         # so we load them with a modified vllm config
-        from vllm.compilation.backends import set_model_tag
-
         temp_vllm_config = create_vllm_config_for_draft_model(self.vllm_config)
-        with set_model_tag("draft_model"):
+        try:
+            from vllm.compilation.backends import set_model_tag
+
+            tag_ctx = set_model_tag("draft_model")
+        except Exception:
+            tag_ctx = nullcontext()
+
+        with tag_ctx:
             model = get_model(
                 vllm_config=temp_vllm_config,
                 prefix="draft_model",

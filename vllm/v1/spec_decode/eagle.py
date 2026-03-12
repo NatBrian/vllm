@@ -56,6 +56,18 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _next_power_of_2(x: int) -> int:
+    if hasattr(triton, "next_power_of_2"):
+        return triton.next_power_of_2(x)
+    if x <= 1:
+        return 1
+    return 1 << ((int(x) - 1).bit_length())
+
+
+def _can_launch_triton_kernel(kernel: object) -> bool:
+    return callable(getattr(kernel, "__getitem__", None))
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -476,7 +488,20 @@ class SpecDecodeBaseProposer:
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
             else:
-                last_hidden_states, hidden_states = ret_hidden_states
+                if isinstance(ret_hidden_states, tuple):
+                    if len(ret_hidden_states) == 0:
+                        raise ValueError("Draft model returned an empty tuple.")
+                    last_hidden_states = ret_hidden_states[0]
+                    hidden_states = (
+                        ret_hidden_states[1]
+                        if len(ret_hidden_states) > 1
+                        else ret_hidden_states[0]
+                    )
+                else:
+                    # Some model variants may return a single tensor even when
+                    # the caller expects tuple outputs.
+                    last_hidden_states = ret_hidden_states
+                    hidden_states = ret_hidden_states
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
@@ -638,7 +663,18 @@ class SpecDecodeBaseProposer:
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
                 else:
-                    last_hidden_states, hidden_states = ret_hidden_states
+                    if isinstance(ret_hidden_states, tuple):
+                        if len(ret_hidden_states) == 0:
+                            raise ValueError("Draft model returned an empty tuple.")
+                        last_hidden_states = ret_hidden_states[0]
+                        hidden_states = (
+                            ret_hidden_states[1]
+                            if len(ret_hidden_states) > 1
+                            else ret_hidden_states[0]
+                        )
+                    else:
+                        last_hidden_states = ret_hidden_states
+                        hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
@@ -695,7 +731,7 @@ class SpecDecodeBaseProposer:
                 cad.max_query_len + self.net_num_new_slots_per_request
             )
             BLOCK_SIZE_TOKENS = min(
-                256, triton.next_power_of_2(max_num_tokens_per_request)
+                256, _next_power_of_2(max_num_tokens_per_request)
             )
             num_blocks = (
                 max_num_tokens_per_request + BLOCK_SIZE_TOKENS - 1
@@ -722,30 +758,41 @@ class SpecDecodeBaseProposer:
             query_end_loc = cad.query_start_loc[1:] - 1
             if num_rejected_tokens_gpu is not None:
                 query_end_loc = query_end_loc - num_rejected_tokens_gpu
-            copy_and_expand_eagle_inputs_kernel[grid](
-                # (Padded) Inputs from the target model
-                target_token_ids_ptr=target_token_ids,
-                target_positions_ptr=target_positions,
-                next_token_ids_ptr=next_token_ids,  # sampled tokens, one per request
-                # Outputs to the drafting buffers
-                out_input_ids_ptr=self.input_ids,
-                out_positions_ptr=self.positions,  # Doesn't support mrope for now
-                out_is_rejected_token_mask_ptr=self.is_rejected_token_mask,
-                out_is_masked_token_mask_ptr=self.is_masked_token_mask,
-                out_new_token_indices_ptr=token_indices_to_sample,
-                out_hidden_state_mapping_ptr=out_hidden_state_mapping,
-                # Input metadata
-                query_start_loc_ptr=query_start_loc,
-                query_end_loc_ptr=query_end_loc,
-                padding_token_id=0,
-                parallel_drafting_token_id=self.parallel_drafting_token_id,
-                # Sizing info
-                # Note that we can deduce batch_size for free from the grid size
-                total_input_tokens=total_num_input_tokens,
-                num_padding_slots_per_request=self.extra_slots_per_request,
-                shift_input_ids=self.pass_hidden_states_to_model,
-                BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
-            )
+            if _can_launch_triton_kernel(copy_and_expand_eagle_inputs_kernel):
+                copy_and_expand_eagle_inputs_kernel[grid](
+                    # (Padded) Inputs from the target model
+                    target_token_ids_ptr=target_token_ids,
+                    target_positions_ptr=target_positions,
+                    next_token_ids_ptr=next_token_ids,  # sampled tokens, one per request
+                    # Outputs to the drafting buffers
+                    out_input_ids_ptr=self.input_ids,
+                    out_positions_ptr=self.positions,  # Doesn't support mrope for now
+                    out_is_rejected_token_mask_ptr=self.is_rejected_token_mask,
+                    out_is_masked_token_mask_ptr=self.is_masked_token_mask,
+                    out_new_token_indices_ptr=token_indices_to_sample,
+                    out_hidden_state_mapping_ptr=out_hidden_state_mapping,
+                    # Input metadata
+                    query_start_loc_ptr=query_start_loc,
+                    query_end_loc_ptr=query_end_loc,
+                    padding_token_id=0,
+                    parallel_drafting_token_id=self.parallel_drafting_token_id,
+                    # Sizing info
+                    # Note that we can deduce batch_size for free from the grid size
+                    total_input_tokens=total_num_input_tokens,
+                    num_padding_slots_per_request=self.extra_slots_per_request,
+                    shift_input_ids=self.pass_hidden_states_to_model,
+                    BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
+                )
+            else:
+                self._copy_and_expand_eagle_inputs_fallback(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    next_token_ids=next_token_ids,
+                    cad=cad,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    token_indices_to_sample=token_indices_to_sample,
+                    out_hidden_state_mapping=out_hidden_state_mapping,
+                )
             if self.pass_hidden_states_to_model:
                 assert self.parallel_drafting_hidden_state_tensor is not None
                 self.hidden_states[out_hidden_state_mapping] = target_hidden_states
@@ -803,6 +850,115 @@ class SpecDecodeBaseProposer:
         if output_idx < len(req_state.output_token_ids):
             return req_state.output_token_ids[output_idx]
         return -1
+
+    def _copy_and_expand_eagle_inputs_fallback(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        cad: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        token_indices_to_sample: torch.Tensor,
+        out_hidden_state_mapping: torch.Tensor,
+    ) -> None:
+        assert self.is_rejected_token_mask is not None
+        assert self.is_masked_token_mask is not None
+
+        num_padding_slots = self.extra_slots_per_request
+        shift_input_ids = self.pass_hidden_states_to_model
+        output_stride_adjust = (
+            num_padding_slots - 1 if shift_input_ids else num_padding_slots
+        )
+
+        query_start_loc_cpu = cad.query_start_loc_cpu.tolist()
+        num_rejected_tokens_cpu: list[int] | None = None
+        if num_rejected_tokens_gpu is not None:
+            num_rejected_tokens_cpu = num_rejected_tokens_gpu.cpu().tolist()
+
+        for request_idx in range(cad.batch_size()):
+            query_start_loc = int(query_start_loc_cpu[request_idx])
+            next_query_start_loc = int(query_start_loc_cpu[request_idx + 1])
+            query_end_loc = next_query_start_loc - 1
+            if num_rejected_tokens_cpu is not None:
+                query_end_loc -= int(num_rejected_tokens_cpu[request_idx])
+
+            if shift_input_ids:
+                num_valid_tokens = query_end_loc - query_start_loc
+                input_offset = 1
+                output_start = query_start_loc + request_idx * output_stride_adjust
+            else:
+                num_valid_tokens = query_end_loc - query_start_loc + 1
+                input_offset = 0
+                output_start = query_start_loc + request_idx * output_stride_adjust
+
+            num_rejected = next_query_start_loc - query_end_loc - 1
+            total_output_tokens = num_valid_tokens + num_padding_slots + num_rejected
+            if total_output_tokens <= 0:
+                continue
+
+            j = torch.arange(total_output_tokens, device=self.device, dtype=torch.int32)
+            is_valid_region = j < num_valid_tokens
+            is_bonus_region = j == num_valid_tokens
+            is_parallel_draft_region = (j > num_valid_tokens) & (
+                j < num_valid_tokens + num_padding_slots
+            )
+            is_rejected_region = j >= num_valid_tokens + num_padding_slots
+
+            out_idx = output_start + j
+            out_idx_long = out_idx.to(torch.long)
+
+            token_ids = torch.full(
+                (total_output_tokens,),
+                fill_value=0,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if num_valid_tokens > 0:
+                in_idx = (
+                    query_start_loc + input_offset + j[is_valid_region]
+                ).to(torch.long)
+                token_ids[is_valid_region] = target_token_ids[in_idx].to(torch.int32)
+
+            token_ids[is_bonus_region] = next_token_ids[request_idx]
+            token_ids[is_parallel_draft_region] = self.parallel_drafting_token_id
+
+            start_pos = target_positions[query_start_loc]
+            positions = start_pos + j.to(dtype=target_positions.dtype)
+            positions = torch.where(
+                is_rejected_region,
+                torch.zeros_like(positions),
+                positions,
+            )
+
+            self.input_ids[out_idx_long] = token_ids
+            self.positions[out_idx_long] = positions
+            self.is_rejected_token_mask[out_idx_long] = is_rejected_region
+            self.is_masked_token_mask[out_idx_long] = is_parallel_draft_region
+
+            is_new_token_region = (j >= num_valid_tokens) & (
+                j < num_valid_tokens + num_padding_slots
+            )
+            new_token_local_idx = j[is_new_token_region] - num_valid_tokens
+            new_token_out_idx = (
+                request_idx * num_padding_slots + new_token_local_idx
+            ).to(torch.long)
+            token_indices_to_sample[new_token_out_idx] = out_idx[is_new_token_region]
+
+            if shift_input_ids:
+                num_input_tokens_this_request = next_query_start_loc - query_start_loc
+                if num_input_tokens_this_request > 0:
+                    src_idx = torch.arange(
+                        query_start_loc,
+                        next_query_start_loc,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    dst_idx = output_start + torch.arange(
+                        num_input_tokens_this_request,
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                    out_hidden_state_mapping[src_idx] = dst_idx
 
     def prepare_next_token_ids_cpu(
         self,
@@ -880,19 +1036,56 @@ class SpecDecodeBaseProposer:
         grid = (batch_size,)
 
         # Find the next power of 2 for block sizes
-        BLOCK_SIZE_TOKENS = triton.next_power_of_2(num_tokens)
-        eagle_prepare_next_token_padded_kernel[grid](
-            sampled_token_ids,
-            discard_request_mask,
-            backup_tokens_gpu,
-            next_token_ids,
-            valid_sampled_tokens_count,
-            gpu_input_batch.vocab_size,
-            num_tokens,
-            batch_size,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
-        )
+        BLOCK_SIZE_TOKENS = _next_power_of_2(num_tokens)
+        if _can_launch_triton_kernel(eagle_prepare_next_token_padded_kernel):
+            eagle_prepare_next_token_padded_kernel[grid](
+                sampled_token_ids,
+                discard_request_mask,
+                backup_tokens_gpu,
+                next_token_ids,
+                valid_sampled_tokens_count,
+                gpu_input_batch.vocab_size,
+                num_tokens,
+                batch_size,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
+            )
+        else:
+            valid_token_mask = (sampled_token_ids != -1) & (
+                sampled_token_ids < gpu_input_batch.vocab_size
+            )
+            valid_sampled_tokens_count = valid_token_mask.sum(
+                dim=1, dtype=torch.int32
+            )
+            token_indices = torch.arange(
+                num_tokens, device=device, dtype=torch.int64
+            ).unsqueeze(0)
+            masked_indices = torch.where(
+                valid_token_mask,
+                token_indices,
+                torch.full_like(token_indices, -1),
+            )
+            last_valid_index = masked_indices.max(dim=1).values
+            safe_last_valid_index = last_valid_index.clamp_min(0)
+            backup_tokens = backup_tokens_gpu[:batch_size]
+            last_valid_token = sampled_token_ids.gather(
+                1, safe_last_valid_index.unsqueeze(1)
+            ).squeeze(1)
+            next_token_ids = torch.where(
+                valid_sampled_tokens_count > 0,
+                last_valid_token.to(torch.int32),
+                backup_tokens,
+            )
+            next_token_ids = torch.where(
+                discard_request_mask,
+                backup_tokens,
+                next_token_ids,
+            )
+            valid_sampled_tokens_count = torch.where(
+                discard_request_mask,
+                torch.zeros_like(valid_sampled_tokens_count),
+                valid_sampled_tokens_count,
+            )
 
         return next_token_ids, valid_sampled_tokens_count
 
@@ -921,14 +1114,38 @@ class SpecDecodeBaseProposer:
         )
 
         grid = (num_reqs,)
-        eagle_prepare_inputs_padded_kernel[grid](
-            spec_decode_metadata.cu_num_draft_tokens,
-            valid_sampled_tokens_count,
-            common_attn_metadata.query_start_loc,
-            token_indices_to_sample,
-            num_rejected_tokens_gpu,
-            num_reqs,
-        )
+        if _can_launch_triton_kernel(eagle_prepare_inputs_padded_kernel):
+            eagle_prepare_inputs_padded_kernel[grid](
+                spec_decode_metadata.cu_num_draft_tokens,
+                valid_sampled_tokens_count,
+                common_attn_metadata.query_start_loc,
+                token_indices_to_sample,
+                num_rejected_tokens_gpu,
+                num_reqs,
+            )
+        else:
+            cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
+            num_draft_tokens = torch.empty_like(valid_sampled_tokens_count)
+            if num_reqs > 0:
+                num_draft_tokens[0] = cu_num_draft_tokens[0]
+            if num_reqs > 1:
+                num_draft_tokens[1:] = (
+                    cu_num_draft_tokens[1:] - cu_num_draft_tokens[:-1]
+                )
+
+            num_rejected_tokens_gpu = (
+                num_draft_tokens + 1 - valid_sampled_tokens_count
+            )
+            num_rejected_tokens_gpu = torch.where(
+                num_draft_tokens > 0,
+                num_rejected_tokens_gpu,
+                torch.zeros_like(num_rejected_tokens_gpu),
+            )
+            token_indices_to_sample = (
+                common_attn_metadata.query_start_loc[1:]
+                - 1
+                - num_rejected_tokens_gpu
+            )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]

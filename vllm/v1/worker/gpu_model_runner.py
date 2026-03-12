@@ -574,6 +574,9 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+            # Backward-compat alias: some code paths still refer to
+            # `spec_decode_sampler`.
+            self.spec_decode_sampler = self.rejection_sampler
             self.specsteer_sampler = SpecSteerSampler(
                 self.sampler,
                 gamma=self.speculative_config.gamma,
@@ -2484,13 +2487,49 @@ class GPUModelRunner(
 
         specsteer_metadata = None
         if include_specsteer_metadata:
+            expected_num_tokens = (
+                int(cu_num_draft_tokens[-1].item())
+                if cu_num_draft_tokens.numel() > 0
+                else 0
+            )
+            base_verifier_logits = self._specsteer_base_logits
+            augmented_drafter_logits = self._specsteer_steer_logits
+            if base_verifier_logits is not None or augmented_drafter_logits is not None:
+                valid_cached_aux = (
+                    base_verifier_logits is not None
+                    and augmented_drafter_logits is not None
+                    and base_verifier_logits.ndim == 2
+                    and augmented_drafter_logits.ndim == 2
+                    and base_verifier_logits.shape[0] == expected_num_tokens
+                    and augmented_drafter_logits.shape[0] == expected_num_tokens
+                )
+                if not valid_cached_aux:
+                    logger.warning_once(
+                        "Dropping cached SpecSteer auxiliary logits due to shape "
+                        "mismatch. expected_num_tokens=%d, base_shape=%s, "
+                        "steer_shape=%s",
+                        expected_num_tokens,
+                        (
+                            None
+                            if base_verifier_logits is None
+                            else tuple(base_verifier_logits.shape)
+                        ),
+                        (
+                            None
+                            if augmented_drafter_logits is None
+                            else tuple(augmented_drafter_logits.shape)
+                        ),
+                    )
+                    base_verifier_logits = None
+                    augmented_drafter_logits = None
+
             specsteer_metadata = SpecSteerMetadata(
                 draft_token_ids=draft_token_ids,
                 num_draft_tokens=num_draft_tokens.tolist(),
                 cu_num_draft_tokens=cu_num_draft_tokens,
                 target_logits_indices=target_logits_indices,
-                base_verifier_logits=None,
-                augmented_drafter_logits=None,
+                base_verifier_logits=base_verifier_logits,
+                augmented_drafter_logits=augmented_drafter_logits,
                 augmented_drafter_logits_indices=target_logits_indices,
             )
 
@@ -4794,6 +4833,11 @@ class GPUModelRunner(
                 stream_role="base_verifier",
             )
             self.specsteer_base_verifier.model = self.drafter.model
+            # Reusing drafter weights also requires reusing the discovered
+            # draft attention-layer names for KV metadata initialization.
+            self.specsteer_base_verifier._draft_attn_layer_names = (
+                self.drafter._draft_attn_layer_names
+            )
             return
 
         self._specsteer_reuse_drafter_weights = False
@@ -5732,12 +5776,45 @@ class GPUModelRunner(
                 device=self.device,
                 dtype=logits.dtype,
             )
-            self.spec_decode_sampler(
-                dummy_spec_decode_metadata,
-                draft_probs,
-                logits,
-                dummy_metadata,
-            )
+            if self.speculative_config.method == "specsteer":
+                target_logits_indices = torch.arange(
+                    num_tokens, dtype=torch.int32, device=self.device
+                )
+                dummy_spec_decode_metadata.target_logits_indices = (
+                    target_logits_indices
+                )
+                dummy_spec_decode_metadata.specsteer = SpecSteerMetadata(
+                    draft_token_ids=dummy_spec_decode_metadata.draft_token_ids,
+                    num_draft_tokens=dummy_spec_decode_metadata.num_draft_tokens,
+                    cu_num_draft_tokens=dummy_spec_decode_metadata.cu_num_draft_tokens,
+                    target_logits_indices=target_logits_indices,
+                    base_verifier_logits=torch.randn(
+                        num_tokens,
+                        logits.shape[-1],
+                        device=self.device,
+                        dtype=logits.dtype,
+                    ),
+                    augmented_drafter_logits=torch.randn(
+                        num_tokens,
+                        logits.shape[-1],
+                        device=self.device,
+                        dtype=logits.dtype,
+                    ),
+                )
+                self.specsteer_sampler(
+                    metadata=dummy_spec_decode_metadata,
+                    logits=logits,
+                    base_logits=None,
+                    steer_logits=None,
+                    sampling_metadata=replace(dummy_metadata, all_greedy=True),
+                )
+            else:
+                self.spec_decode_sampler(
+                    dummy_spec_decode_metadata,
+                    draft_probs,
+                    logits,
+                    dummy_metadata,
+                )
         return sampler_output
 
     def _dummy_pooler_run_task(

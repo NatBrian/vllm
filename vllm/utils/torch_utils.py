@@ -5,9 +5,11 @@ import importlib.metadata
 import os
 import random
 import threading
+import types
 from collections.abc import Callable, Collection
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import (TYPE_CHECKING, Any, Dict, FrozenSet, List, Set, Tuple,
+                    TypeVar, Union, get_args, get_origin, get_type_hints)
 
 import numpy as np
 import numpy.typing as npt
@@ -789,6 +791,59 @@ def supports_xpu_graph() -> bool:
 vllm_lib = Library("vllm", "FRAGMENT")  # noqa
 
 
+def _normalize_infer_schema_annotation(annotation: Any) -> Any:
+    """Normalize annotations for PyTorch infer_schema compatibility.
+
+    PyTorch can reject some PEP 585 built-in generics like list[int] while
+    accepting typing.List[int].
+    """
+    origin = get_origin(annotation)
+    if origin is None:
+        return annotation
+
+    args = tuple(_normalize_infer_schema_annotation(arg)
+                 for arg in get_args(annotation))
+
+    if origin is list:
+        return List[args[0] if args else Any]
+    if origin is dict:
+        key_type = args[0] if len(args) > 0 else Any
+        value_type = args[1] if len(args) > 1 else Any
+        return Dict[key_type, value_type]
+    if origin is tuple:
+        return Tuple.__getitem__(args)
+    if origin is set:
+        return Set[args[0] if args else Any]
+    if origin is frozenset:
+        return FrozenSet[args[0] if args else Any]
+    if origin in (types.UnionType, Union):
+        return Union.__getitem__(args)
+
+    return annotation
+
+
+def _normalize_op_annotations_for_infer_schema(op_func: Callable) -> Callable:
+    try:
+        annotations = get_type_hints(op_func, include_extras=True)
+    except Exception:
+        annotations = getattr(op_func, "__annotations__", None)
+    if not annotations:
+        return op_func
+
+    normalized: dict[str, Any] = {}
+    changed = False
+    for name, annotation in annotations.items():
+        normalized_annotation = _normalize_infer_schema_annotation(annotation)
+        normalized[name] = normalized_annotation
+        if normalized_annotation is not annotation:
+            changed = True
+
+    if changed:
+        op_func.__annotations__ = normalized
+
+    return op_func
+
+
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
@@ -821,7 +876,17 @@ def direct_register_custom_op(
 
         dispatch_key = current_platform.dispatch_key
 
-    schema_str = infer_schema(op_func, mutates_args=mutates_args)
+    op_func = _normalize_op_annotations_for_infer_schema(op_func)
+    try:
+        schema_str = infer_schema(op_func, mutates_args=mutates_args)
+    except ValueError as exc:
+        logger.warning(
+            "Skipping custom op registration for %s due to infer_schema "
+            "incompatibility: %s",
+            op_name,
+            exc,
+        )
+        return
 
     my_lib = target_lib or vllm_lib
     my_lib.define(op_name + schema_str, tags=tags)

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import tempfile
@@ -16,6 +15,11 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -38,6 +42,10 @@ _global_experts_reader: RoutedExpertsReader | None = None
 def _file_lock(lock_file: str, mode: str = "wb+") -> Generator[None, None, None]:
     """Context manager for file-based locking."""
     with open(lock_file, mode) as fp:
+        if fcntl is None:
+            yield
+            return
+
         fcntl.flock(fp, fcntl.LOCK_EX)
         try:
             yield

@@ -11,6 +11,10 @@ from vllm.v1.attention.backends.utils import (
 PADDING_SLOT_ID = -1
 
 
+def _can_launch_triton_kernel(kernel: object) -> bool:
+    return callable(getattr(kernel, "__getitem__", None))
+
+
 @triton.jit
 def eagle_step_slot_mapping_metadata_kernel(
     positions_ptr,  # [batch_size] - current positions (1D view for M-RoPE)
@@ -104,19 +108,49 @@ def eagle_step_update_slot_mapping_and_metadata(
         input_batch_size = batch_size
     n_blocks_per_req = block_table_tensor.shape[1]
 
-    eagle_step_slot_mapping_metadata_kernel[(input_batch_size,)](
-        positions_1d,
-        block_table_tensor,
-        block_table_tensor.stride(0),
-        seq_lens,
-        out_clamped_positions,
-        out_slot_mapping,
-        block_size=block_size,
-        max_model_len=max_model_len,
-        n_blocks_per_req=n_blocks_per_req,
-        PAD_ID=PADDING_SLOT_ID,
-        batch_size=batch_size,
+    if _can_launch_triton_kernel(eagle_step_slot_mapping_metadata_kernel):
+        eagle_step_slot_mapping_metadata_kernel[(input_batch_size,)](
+            positions_1d,
+            block_table_tensor,
+            block_table_tensor.stride(0),
+            seq_lens,
+            out_clamped_positions,
+            out_slot_mapping,
+            block_size=block_size,
+            max_model_len=max_model_len,
+            n_blocks_per_req=n_blocks_per_req,
+            PAD_ID=PADDING_SLOT_ID,
+            batch_size=batch_size,
+        )
+        return
+
+    new_positions = positions_1d + 1
+    exceeds_max = new_positions >= max_model_len
+    clamped_positions = torch.where(exceeds_max, torch.zeros_like(new_positions), new_positions)
+
+    block_numbers = torch.div(
+        clamped_positions.to(torch.int64),
+        block_size,
+        rounding_mode="floor",
+    ).clamp(max=n_blocks_per_req - 1)
+    req_indices = torch.arange(batch_size, device=positions_1d.device, dtype=torch.long)
+    block_ids = block_table_tensor[req_indices, block_numbers]
+
+    slot_ids = block_ids * block_size + (clamped_positions.to(block_ids.dtype) % block_size)
+    slot_ids = torch.where(
+        exceeds_max,
+        torch.full_like(slot_ids, PADDING_SLOT_ID),
+        slot_ids,
     )
+
+    new_seq_lens = torch.where(exceeds_max, torch.ones_like(seq_lens), seq_lens + 1)
+    new_seq_lens = new_seq_lens.clamp(max=max_model_len)
+
+    seq_lens.copy_(new_seq_lens.to(seq_lens.dtype))
+    out_clamped_positions[:batch_size] = clamped_positions.to(out_clamped_positions.dtype)
+    out_slot_mapping[:batch_size] = slot_ids.to(out_slot_mapping.dtype)
+    if input_batch_size > batch_size:
+        out_slot_mapping[batch_size:input_batch_size] = PADDING_SLOT_ID
 
 
 @triton.jit

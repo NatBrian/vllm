@@ -131,6 +131,9 @@ def _maybe_force_spawn():
         return
 
     reasons = []
+    if sys.platform.startswith("win"):
+        reasons.append("Windows does not support fork")
+
     if is_in_ray_actor():
         # even if we choose to spawn, we need to pass the ray address
         # to the subprocess so that it knows how to connect to the ray cluster.
