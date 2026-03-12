@@ -32,6 +32,7 @@ from vllm.config import (
     set_current_vllm_config,
     update_config,
 )
+from vllm.config.utils import replace as config_replace
 from vllm.config.cache import CacheConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -159,18 +160,20 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.specsteer_sampler import SpecSteerSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata, SpecSteerMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.specsteer_proposer import SpecSteerProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -510,6 +513,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DraftModelProposer
+                | SpecSteerProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
             )
@@ -517,6 +521,13 @@ class GPUModelRunner(
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "specsteer":
+                self.drafter = SpecSteerProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                    stream_role="augmented_drafter",
+                )
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -563,6 +574,23 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+            self.specsteer_sampler = SpecSteerSampler(
+                self.sampler,
+                gamma=self.speculative_config.gamma,
+                eps=self.speculative_config.eps,
+                fusion_method=self.speculative_config.fusion_method,
+                linear_coeff=(
+                    self.speculative_config.beta
+                    if self.speculative_config.fusion_coeff is None
+                    else self.speculative_config.fusion_coeff
+                ),
+                costeer_T=self.speculative_config.T,
+                costeer_alpha=self.speculative_config.alpha,
+                costeer_beta=self.speculative_config.beta,
+                costeer_player_lambda=self.speculative_config.player_lambda,
+                costeer_eta=self.speculative_config.eta,
+                enable_bonus_token=self.speculative_config.specsteer_enable_bonus_token,
+            )
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -757,6 +785,11 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self.specsteer_augmented_logits: torch.Tensor | None = None
+        self._specsteer_base_logits: torch.Tensor | None = None
+        self._specsteer_steer_logits: torch.Tensor | None = None
+        self.specsteer_base_verifier: SpecSteerProposer | None = None
+        self._specsteer_reuse_drafter_weights = False
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -1012,6 +1045,12 @@ class GPUModelRunner(
 
         self.num_sms = num_compute_units(self.device.index)
 
+    def _on_request_removed_from_batch(self, req_id: str) -> None:
+        if self.speculative_config and hasattr(self, "drafter"):
+            on_remove = getattr(self.drafter, "on_request_removed", None)
+            if callable(on_remove):
+                on_remove(req_id)
+
     # Note: used for model runner override.
     def _sync_device(self) -> None:
         torch.accelerator.synchronize()
@@ -1041,6 +1080,7 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+            self._on_request_removed_from_batch(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
@@ -1072,6 +1112,7 @@ class GPUModelRunner(
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
+            self._on_request_removed_from_batch(req_id)
 
         is_ngram_gpu = (
             self.speculative_config is not None
@@ -1114,6 +1155,7 @@ class GPUModelRunner(
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
+                draft_prompt_token_ids=new_req_data.draft_prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
@@ -1390,9 +1432,11 @@ class GPUModelRunner(
         previously generated but now are input context (part of the prompt).
         """
         self.input_batch.remove_request(req_id)
+        self._on_request_removed_from_batch(req_id)
         req_state = self.requests[req_id]
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
+        req_state.draft_prompt_token_ids = new_req_data.draft_prompt_token_ids
         req_state.mm_features = new_req_data.mm_features
         req_state.prompt_embeds = new_req_data.prompt_embeds
         req_state.sampling_params = new_req_data.sampling_params
@@ -1859,7 +1903,12 @@ class GPUModelRunner(
                 ):
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
             spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
+                num_draft_tokens,
+                cu_num_tokens,
+                include_specsteer_metadata=(
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "specsteer"
+                ),
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
@@ -2366,6 +2415,8 @@ class GPUModelRunner(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
+        *,
+        include_specsteer_metadata: bool = False,
     ) -> SpecDecodeMetadata:
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
@@ -2431,6 +2482,18 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        specsteer_metadata = None
+        if include_specsteer_metadata:
+            specsteer_metadata = SpecSteerMetadata(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=num_draft_tokens.tolist(),
+                cu_num_draft_tokens=cu_num_draft_tokens,
+                target_logits_indices=target_logits_indices,
+                base_verifier_logits=None,
+                augmented_drafter_logits=None,
+                augmented_drafter_logits_indices=target_logits_indices,
+            )
+
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2439,6 +2502,7 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            specsteer=specsteer_metadata,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3083,6 +3147,66 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _validate_specsteer_sampling_inputs(
+        self,
+        logits: torch.Tensor | None,
+        metadata: SpecDecodeMetadata,
+    ) -> None:
+        if logits is None:
+            raise ValueError("SpecSteer requires logits to be present for sampling.")
+
+        specsteer_metadata = metadata.specsteer
+        if specsteer_metadata is None:
+            raise ValueError(
+                "SpecSteer sampler invoked without SpecSteer metadata payload."
+            )
+
+        num_tokens = int(specsteer_metadata.draft_token_ids.shape[0])
+        cu_num_draft_tokens = specsteer_metadata.cu_num_draft_tokens
+        expected_num_tokens = (
+            int(cu_num_draft_tokens[-1].item())
+            if cu_num_draft_tokens.numel() > 0
+            else 0
+        )
+        if expected_num_tokens != num_tokens:
+            raise ValueError(
+                "SpecSteer metadata mismatch: draft_token_ids has "
+                f"{num_tokens} rows but cu_num_draft_tokens[-1] is "
+                f"{expected_num_tokens}."
+            )
+
+        if specsteer_metadata.target_logits_indices.shape[0] != num_tokens:
+            raise ValueError(
+                "SpecSteer metadata mismatch: target_logits_indices length "
+                f"{specsteer_metadata.target_logits_indices.shape[0]} does not match "
+                f"num_tokens {num_tokens}."
+            )
+
+        if not torch.equal(
+            metadata.target_logits_indices, specsteer_metadata.target_logits_indices
+        ):
+            raise ValueError(
+                "SpecSteer metadata mismatch: target_logits_indices diverged between "
+                "SpecDecodeMetadata and SpecSteerMetadata."
+            )
+
+        for name, aux_logits in (
+            ("base_verifier_logits", specsteer_metadata.base_verifier_logits),
+            ("augmented_drafter_logits", specsteer_metadata.augmented_drafter_logits),
+        ):
+            if aux_logits is None:
+                continue
+            if aux_logits.ndim != 2:
+                raise ValueError(
+                    f"SpecSteer {name} must be rank-2, got shape "
+                    f"{tuple(aux_logits.shape)}."
+                )
+            if aux_logits.shape[0] != num_tokens:
+                raise ValueError(
+                    f"SpecSteer {name} has {aux_logits.shape[0]} rows but expected "
+                    f"{num_tokens}."
+                )
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -3099,13 +3223,23 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
 
+        if self.speculative_config and self.speculative_config.method == "specsteer":
+            self._validate_specsteer_sampling_inputs(logits, spec_decode_metadata)
+            return self.specsteer_sampler(
+                metadata=spec_decode_metadata,
+                logits=logits,
+                base_logits=None,
+                steer_logits=None,
+                sampling_metadata=sampling_metadata,
+            )
+
         # Update spec_token_ids with real draft tokens from pre step only when
         # output_token_ids is needed (penalties or bad_words are in use).
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        sampler_output = self.rejection_sampler(
+        sampler_output = self.spec_decode_sampler(
             spec_decode_metadata,
             None,  # draft_probs
             logits,
@@ -3927,6 +4061,8 @@ class GPUModelRunner(
                 )
 
         self._draft_token_ids = None
+        self._specsteer_base_logits = None
+        self._specsteer_steer_logits = None
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3943,6 +4079,7 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    accepted_draft_token_counts=sampler_output.accepted_draft_token_counts,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -3956,6 +4093,7 @@ class GPUModelRunner(
             use_gpu_toks = (
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
+                or spec_config.use_specsteer()
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
@@ -3963,7 +4101,10 @@ class GPUModelRunner(
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer
+                    | DraftModelProposer
+                    | SpecSteerProposer
+                    | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4221,6 +4362,26 @@ class GPUModelRunner(
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    @staticmethod
+    def _specsteer_verified_valid_counts(
+        accepted_draft_token_counts: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> torch.Tensor:
+        """Return per-request valid counts for verifier-cache bookkeeping.
+
+        Keep speculative-verified cache through context + accepted draft tokens
+        only (exclude recovery / bonus tokens).
+        """
+        valid_counts = accepted_draft_token_counts.to(dtype=torch.int32).clone()
+        if num_draft_tokens:
+            max_counts = torch.tensor(
+                num_draft_tokens,
+                dtype=torch.int32,
+                device=valid_counts.device,
+            )
+            valid_counts = torch.minimum(valid_counts, max_counts)
+        return valid_counts
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4232,6 +4393,7 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        accepted_draft_token_counts: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -4367,8 +4529,25 @@ class GPUModelRunner(
                 next_token_ids, valid_sampled_tokens_count
             )
 
-        elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+        elif (
+            spec_config.use_eagle()
+            or spec_config.uses_draft_model()
+            or spec_config.use_specsteer()
+        ):
+            assert isinstance(
+                self.drafter, EagleProposer | DraftModelProposer | SpecSteerProposer
+            )
+
+            if (
+                spec_config.use_specsteer()
+                and accepted_draft_token_counts is not None
+                and isinstance(self.drafter, SpecSteerProposer)
+            ):
+                self.drafter.update_accepted_draft_token_counts(
+                    self.requests,
+                    self.input_batch.req_ids,
+                    accepted_draft_token_counts,
+                )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4437,6 +4616,17 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[token_indices]
                 else:
+                    valid_counts_for_prepare = valid_sampled_tokens_count
+                    if (
+                        spec_config.use_specsteer()
+                        and accepted_draft_token_counts is not None
+                    ):
+                        valid_counts_for_prepare = (
+                            self._specsteer_verified_valid_counts(
+                                accepted_draft_token_counts,
+                                spec_decode_metadata.num_draft_tokens,
+                            )
+                        )
                     (
                         common_attn_metadata,
                         token_indices_to_sample,
@@ -4444,7 +4634,7 @@ class GPUModelRunner(
                     ) = self.drafter.prepare_inputs_padded(
                         common_attn_metadata,
                         spec_decode_metadata,
-                        valid_sampled_tokens_count,
+                        valid_counts_for_prepare,
                     )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
@@ -4466,7 +4656,7 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
+            propose_output = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -4478,8 +4668,156 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            if spec_config.use_specsteer():
+                assert isinstance(propose_output, tuple)
+                draft_token_ids, self.specsteer_augmented_logits = propose_output
+                if spec_decode_metadata is not None:
+                    expected_num_tokens = (
+                        int(spec_decode_metadata.cu_num_draft_tokens[-1])
+                        if spec_decode_metadata.cu_num_draft_tokens.numel() > 0
+                        else 0
+                    )
+                    actual_num_tokens = self.specsteer_augmented_logits.shape[0]
+                    assert actual_num_tokens == expected_num_tokens, (
+                        "SpecSteer metadata mismatch before sampling: "
+                        "draft_token_ids has "
+                        f"{actual_num_tokens} rows but "
+                        f"cu_num_draft_tokens[-1] is {expected_num_tokens}."
+                    )
+                self._set_specsteer_aux_logits(
+                    steer_logits=self.specsteer_augmented_logits,
+                    base_logits=self._run_specsteer_base_verifier_forward(
+                        target_token_ids=target_token_ids,
+                        target_positions=target_positions,
+                        target_hidden_states=target_hidden_states,
+                        next_token_ids=next_token_ids,
+                        token_indices_to_sample=token_indices_to_sample,
+                        sampling_metadata=sampling_metadata,
+                        common_attn_metadata=common_attn_metadata,
+                        mm_embed_inputs=mm_embed_inputs,
+                        num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                        slot_mappings=slot_mappings,
+                    ),
+                    spec_decode_metadata=spec_decode_metadata,
+                )
+            else:
+                draft_token_ids = propose_output
 
         return draft_token_ids
+
+    def _run_specsteer_base_verifier_forward(
+        self,
+        *,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        sampling_metadata: SamplingMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+    ) -> torch.Tensor:
+        verifier = self.specsteer_base_verifier
+        if verifier is None:
+            raise RuntimeError("SpecSteer base verifier is not initialized.")
+
+        propose_output = verifier.propose(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            sampling_metadata=sampling_metadata,
+            common_attn_metadata=deepcopy(common_attn_metadata),
+            mm_embed_inputs=mm_embed_inputs,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            slot_mappings=deepcopy(slot_mappings),
+        )
+        assert isinstance(propose_output, tuple)
+        _, base_logits = propose_output
+        return base_logits
+
+    def _set_specsteer_aux_logits(
+        self,
+        *,
+        steer_logits: torch.Tensor,
+        base_logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        self._specsteer_steer_logits = steer_logits
+        self._specsteer_base_logits = base_logits
+        if spec_decode_metadata is not None and spec_decode_metadata.specsteer:
+            specsteer_metadata = spec_decode_metadata.specsteer
+            num_tokens = int(specsteer_metadata.draft_token_ids.shape[0])
+            expected_num_tokens = (
+                int(specsteer_metadata.cu_num_draft_tokens[-1].item())
+                if specsteer_metadata.cu_num_draft_tokens.numel() > 0
+                else 0
+            )
+            if expected_num_tokens != num_tokens:
+                raise ValueError(
+                    "SpecSteer metadata mismatch before sampling: draft_token_ids has "
+                    f"{num_tokens} rows but cu_num_draft_tokens[-1] is "
+                    f"{expected_num_tokens}."
+                )
+            for name, aux_logits in (
+                ("base_verifier_logits", base_logits),
+                ("augmented_drafter_logits", steer_logits),
+            ):
+                if aux_logits.ndim != 2:
+                    raise ValueError(
+                        f"SpecSteer {name} must be rank-2, got shape "
+                        f"{tuple(aux_logits.shape)}."
+                    )
+                if aux_logits.shape[0] != num_tokens:
+                    raise ValueError(
+                        f"SpecSteer {name} has {aux_logits.shape[0]} rows but "
+                        f"expected {num_tokens}."
+                    )
+
+            specsteer_metadata.base_verifier_logits = base_logits
+            specsteer_metadata.augmented_drafter_logits = steer_logits
+
+    def _initialize_specsteer_base_verifier(self) -> None:
+        assert self.speculative_config is not None
+        assert isinstance(self.drafter, SpecSteerProposer)
+
+        base_model = self.speculative_config.base_model
+        if base_model is None or base_model == self.speculative_config.model:
+            self._specsteer_reuse_drafter_weights = True
+            self.specsteer_base_verifier = SpecSteerProposer(
+                vllm_config=self.vllm_config,
+                device=self.device,
+                runner=self,
+                stream_role="base_verifier",
+            )
+            self.specsteer_base_verifier.model = self.drafter.model
+            return
+
+        self._specsteer_reuse_drafter_weights = False
+        assert self.speculative_config.draft_model_config is not None
+        base_model_config = config_replace(
+            self.speculative_config.draft_model_config,
+            model=base_model,
+        )
+        base_speculative_config = config_replace(
+            self.speculative_config,
+            model=base_model,
+            draft_model_config=base_model_config,
+        )
+        base_vllm_config = config_replace(
+            self.vllm_config,
+            speculative_config=base_speculative_config,
+        )
+        self.specsteer_base_verifier = SpecSteerProposer(
+            vllm_config=base_vllm_config,
+            device=self.device,
+            runner=self,
+            stream_role="base_verifier",
+        )
+        self.specsteer_base_verifier.load_model(self.model)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
@@ -4524,6 +4862,12 @@ class GPUModelRunner(
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
+                    if (
+                        self.speculative_config is not None
+                        and self.speculative_config.use_specsteer()
+                        and isinstance(self.drafter, SpecSteerProposer)
+                    ):
+                        self._initialize_specsteer_base_verifier()
                     if (
                         hasattr(self.drafter, "model")
                         and is_mixture_of_experts(self.drafter.model)
@@ -4589,10 +4933,17 @@ class GPUModelRunner(
         )
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
+            drafter_model = None
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+            if (
+                (base_verifier := self.specsteer_base_verifier) is not None
+                and (base_model := getattr(base_verifier, "model", None)) is not None
+                and base_model is not drafter_model
+            ):
+                prepare_communication_buffer_for_model(base_model)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
@@ -5241,11 +5592,15 @@ class GPUModelRunner(
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
+                or self.speculative_config.use_specsteer()
                 or self.speculative_config.uses_extract_hidden_states()
             ):
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer
+                    | DraftModelProposer
+                    | SpecSteerProposer
+                    | ExtractHiddenStatesProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -5377,7 +5732,7 @@ class GPUModelRunner(
                 device=self.device,
                 dtype=logits.dtype,
             )
-            self.rejection_sampler(
+            self.spec_decode_sampler(
                 dummy_spec_decode_metadata,
                 draft_probs,
                 logits,
@@ -5961,9 +6316,16 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
+            or self.speculative_config.use_specsteer()
         ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(
+                self.drafter, EagleProposer | DraftModelProposer | SpecSteerProposer
+            )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+            if self.specsteer_base_verifier is not None:
+                self.specsteer_base_verifier.initialize_attn_backend(
+                    kv_cache_config, kernel_block_sizes
+                )
 
     def _check_and_update_cudagraph_mode(
         self,

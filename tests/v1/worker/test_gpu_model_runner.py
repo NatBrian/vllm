@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata, SpecSteerMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
@@ -222,6 +223,50 @@ def test_select_common_block_size_no_valid_option():
 
     with pytest.raises(ValueError):
         select_common_block_size(48, [backend_a, backend_b])
+
+
+def test_specsteer_set_aux_logits_keeps_distinct_base_and_steer_logits():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._specsteer_base_logits = None
+    runner._specsteer_steer_logits = None
+
+    draft_token_ids = torch.tensor([1, 2], dtype=torch.int32)
+    target_logits_indices = torch.tensor([0, 1], dtype=torch.int32)
+    spec_metadata = SpecSteerMetadata(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32),
+        target_logits_indices=target_logits_indices,
+    )
+    metadata = SpecDecodeMetadata(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32),
+        cu_num_sampled_tokens=torch.tensor([3], dtype=torch.int32),
+        target_logits_indices=target_logits_indices,
+        bonus_logits_indices=torch.tensor([2], dtype=torch.int32),
+        logits_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        specsteer=spec_metadata,
+    )
+
+    steer_logits = torch.tensor([[3.0, 1.0], [2.0, 4.0]])
+    base_logits = torch.tensor([[1.0, 2.0], [4.0, 1.0]])
+
+    runner._set_specsteer_aux_logits(
+        steer_logits=steer_logits,
+        base_logits=base_logits,
+        spec_decode_metadata=metadata,
+    )
+
+    assert torch.equal(runner._specsteer_steer_logits, steer_logits)
+    assert torch.equal(runner._specsteer_base_logits, base_logits)
+    assert not torch.equal(
+        runner._specsteer_steer_logits,
+        runner._specsteer_base_logits,
+    )
+    assert metadata.specsteer is not None
+    assert torch.equal(metadata.specsteer.augmented_drafter_logits, steer_logits)
+    assert torch.equal(metadata.specsteer.base_verifier_logits, base_logits)
 
 
 def test_update_states_new_request(model_runner, dist_init):
@@ -1304,3 +1349,42 @@ def test_cudagraph_sizes_capped_for_mamba_cache():
             compilation_config.cudagraph_capture_sizes[-1]
             == compilation_config.max_cudagraph_capture_size
         )
+
+
+def test_specsteer_verified_valid_counts_tracks_accepted_prefix() -> None:
+    accepted_draft_counts = torch.tensor([0, 2, 4], dtype=torch.int32)
+    num_draft_tokens = [4, 4, 4]
+
+    valid_counts = GPUModelRunner._specsteer_verified_valid_counts(
+        accepted_draft_counts,
+        num_draft_tokens,
+    )
+
+    assert valid_counts.tolist() == [0, 2, 4]
+
+
+def test_specsteer_verified_valid_counts_clamps_to_draft_len() -> None:
+    accepted_draft_counts = torch.tensor([5, 1], dtype=torch.int32)
+    num_draft_tokens = [3, 2]
+
+    valid_counts = GPUModelRunner._specsteer_verified_valid_counts(
+        accepted_draft_counts,
+        num_draft_tokens,
+    )
+
+    assert valid_counts.tolist() == [3, 1]
+
+
+def test_specsteer_verified_valid_counts_excludes_recovery_token() -> None:
+    # Verifier accepted counts can include the recovery token (+1).
+    # For the next speculative prepare step, only draft-token acceptance should
+    # survive, so values must be clamped to num_draft_tokens.
+    accepted_draft_counts = torch.tensor([4, 3], dtype=torch.int32)
+    num_draft_tokens = [3, 2]
+
+    valid_counts = GPUModelRunner._specsteer_verified_valid_counts(
+        accepted_draft_counts,
+        num_draft_tokens,
+    )
+
+    assert valid_counts.tolist() == [3, 2]

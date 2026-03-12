@@ -52,6 +52,7 @@ SpeculativeMethod = Literal[
     "ngram",
     "medusa",
     "mlp_speculator",
+    "specsteer",
     "draft_model",
     "suffix",
     EagleModelTypes,
@@ -76,6 +77,13 @@ class SpeculativeConfig:
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
+    base_model: str | None = None
+    """Optional base verifier model for specsteer-style decoding.
+
+    If unset (or equal to ``model``), the same model can be reused for both
+    augmented drafting and base verification while keeping independent logical
+    state (e.g., separate KV/cache streams).
+    """
     method: SpeculativeMethod | None = None
     """The name of the speculative method to use. If users provide and set the
     `model` param, the speculative method type will be detected automatically
@@ -180,6 +188,43 @@ class SpeculativeConfig:
     or probabilistic rejection sampling. Both respect the target model
     distribution, but the latter yields a higher acceptance rate at the cost
     of more memory to cache draft logits."""
+
+    # SpecSteer configuration
+    gamma: float = 0.6
+    """SpecSteer acceptance threshold scale used in
+    ``p_target > gamma * (p_base + eps)``."""
+    eps: float = 1e-10
+    """Small constant added to the base probability in the acceptance test
+    for numerical stability."""
+    fusion_method: Literal["costeer", "linear"] = "costeer"
+    """Fusion strategy used to recover the token at the first rejection.
+
+    Mirrors ``get_fusion_strategy`` in ``vllm/v1/specsteer.py``:
+    ``"linear"`` selects linear fusion, and all other values fall back to
+    CoSteer.
+    """
+    T: int = 20
+    """Number of CoSteer iterative updates (``t = 1..T``)."""
+    alpha: float = 2.0
+    """CoSteer weight for ``(log_player - ref_log)`` in each iteration."""
+    beta: float = 1.5
+    """CoSteer weight for context-gain (``delta``).
+
+    Also used as the linear-fusion coefficient fallback when
+    ``fusion_coeff`` is ``None``.
+    """
+    player_lambda: float = 2.0
+    """CoSteer denominator/reference-mixing scale (``player_lambda``)."""
+    eta: float = 10.0
+    """CoSteer momentum-like scale used as ``1 / eta`` in the update."""
+    fusion_coeff: float | None = None
+    """Linear-fusion coefficient.
+
+    If unset, linear fusion falls back to ``beta``, matching
+    ``LinearFusion`` in ``vllm/v1/specsteer.py``.
+    """
+    vocab_align_method: Literal["pad_truncate"] = "pad_truncate"
+    specsteer_enable_bonus_token: bool = False
 
     def compute_hash(self) -> str:
         """
@@ -360,6 +405,14 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        if self.method == "specsteer":
+            if self.model is None:
+                raise ValueError("specsteer requires `model` to be provided.")
+            if self.num_speculative_tokens is None:
+                raise ValueError(
+                    "specsteer requires `num_speculative_tokens` to be provided."
+                )
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -380,6 +433,15 @@ class SpeculativeConfig:
                 self.model = "ngram_gpu"
             elif self.method == "suffix":
                 self.model = "suffix"
+            elif self.method == "specsteer":
+                if self.target_model_config is None:
+                    raise ValueError(
+                        "target_model_config must be present for specsteer"
+                    )
+                # SpecSteer still requires draft proposals.
+                self.model = self.target_model_config.model
+                if not self.quantization:
+                    self.quantization = self.target_model_config.quantization
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
             else:
@@ -514,7 +576,7 @@ class SpeculativeConfig:
                             "one layer. Might need some code changes "
                             "to support multiple layers."
                         )
-                elif self.method == "draft_model":
+                elif self.method in ("draft_model", "specsteer"):
                     pass
                 else:
                     raise NotImplementedError(
@@ -811,7 +873,7 @@ class SpeculativeConfig:
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
-            self.method == "draft_model"
+            self.method in ("draft_model",)
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
@@ -836,7 +898,7 @@ class SpeculativeConfig:
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
             slots_per_req = self.num_speculative_tokens - 1
-        if self.uses_draft_model():
+        if self.uses_draft_model() or self.use_specsteer():
             # For draft model-based speculation, we need one new slot per request
             # Since we do not slice the draft tokens
             slots_per_req += 1
@@ -846,7 +908,13 @@ class SpeculativeConfig:
         return self.method in ("eagle", "eagle3", "mtp")
 
     def uses_draft_model(self) -> bool:
-        return self.method == "draft_model"
+        return self.method in ("draft_model", "specsteer")
+
+    def uses_specsteer(self) -> bool:
+        return self.method == "specsteer"
+
+    def use_specsteer(self) -> bool:
+        return self.method == "specsteer"
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
